@@ -13,13 +13,6 @@ KDRFC_VERSION=Gem.loaded_specs["kramdown-rfc2629"].version rescue "unknown-versi
 
 Encoding.default_external = "UTF-8" # wake up, smell the coffee
 
-# Note that this doesn't attempt to handle HT characters
-def remove_indentation(s)
-  l = s.lines
-  indent = l.grep(/\S/).map {|l| l[/^\s*/].size}.min
-  l.map {|li| li.sub(/^ {0,#{indent}}/, "")}.join
-end
-
 def add_quote(s)
   l = s.lines
   l.map {|li| "> #{li}"}.join
@@ -75,9 +68,10 @@ end
 
 
 def boilerplate(key)
+  ret = ''
   case key.downcase
-  when /\Abcp14(info)?(\+)?(-tagged)?\z/i
-    ret = ''
+  when /\Abcp14(info)?(\+)?(-tagged)?(-bcp(14)?)?\z/i
+    #            $1    $2     $3       $4  $5
     if $1
       ret << <<RFC8174ise
 Although this document is not an IETF Standards Track publication, it
@@ -115,9 +109,52 @@ PLUS
 *[OPTIONAL]: <bcp14>
 TAGGED
     end
+    if $4                       # experimental; idnits complains:
+      if $5
+      #  ** The document contains RFC2119-like boilerplate, but doesn't seem to
+      #     mention RFC 2119.  The boilerplate contains a reference [BCP14], but that
+      #     reference does not seem to mention RFC 2119 either.
+        ret.sub!("BCP 14 {{!RFC2119}} {{!RFC8174}}",
+                 "{{!BCP14}} ({{RFC2119}}) ({{RFC8174}})")
+      else
+      #  ** The document seems to lack a both a reference to RFC 2119 and the
+      #     recommended RFC 2119 boilerplate, even if it appears to use RFC 2119
+      #     keywords -- however, there's a paragraph with a matching beginning.
+      #     Boilerplate error?
+        ret.sub!("{{!RFC2119}} {{!RFC8174}}", "{{!BCP14}}")
+      end
+    end
     ret
+  when /\Arfc\s*7942(info)?\z/i
+    if $1
+      ret << <<INFO
+(Boilerplate as per {{Section 2.1 of RFC7942}}:)
+
+INFO
+    end
+    ret << <<RFC7942
+This section records the status of known implementations of the
+protocol defined by this specification at the time of posting of
+this Internet-Draft, and is based on a proposal described in
+{{?RFC7942}}.  The description of implementations in this section is
+intended to assist the IETF in its decision processes in
+progressing drafts to RFCs.  Please note that the listing of any
+individual implementation here does not imply endorsement by the
+IETF.  Furthermore, no effort has been spent to verify the
+information presented here that was supplied by IETF contributors.
+This is not intended as, and must not be construed to be, a
+catalog of available implementations or their features.  Readers
+are advised to note that other implementations may exist.
+
+According to {{?RFC7942}}, "this will allow reviewers and working
+groups to assign due consideration to documents that have the
+benefit of running code, which may serve as evidence of valuable
+experimentation and feedback that have made the implemented
+protocols more mature.  It is up to the individual working groups
+to use this information as they see fit".
+RFC7942
   else
-    warn "** Unknwon boilerplate key: #{key}"
+    warn "** Unknown boilerplate key: #{key}"
     "{::boilerplate #{key}}"
   end
 end
@@ -141,8 +178,8 @@ def do_the_tls_dance
   end
 end
 
-RE_NL = /(?:\n|\r|\r\n)/
-RE_SECTION = /---(?: +(\w+)(-?))?\s*#{RE_NL}(.*?#{RE_NL})(?=---(?:\s+\w+-?)?\s*#{RE_NL}|\Z)/m
+RE_NL = /(?:\r\n|\n|\r)/
+RE_SECTION = /---(?: +(\w+)(-?))? *#{RE_NL}(.*?#{RE_NL})(?=---(?:\s+\w+-?)?\s*#{RE_NL}|\Z)/m
 
 NMDTAGS = ["{:/nomarkdown}\n\n", "\n\n{::nomarkdown}\n"]
 
@@ -229,6 +266,8 @@ def spacify_re(s)
   s.gsub(' ', '[\u00A0\s]+')
 end
 
+include ::Kramdown::Utils::Html
+
 def xml_from_sections(input)
 
   unless ENV["KRAMDOWN_NO_SOURCE"]
@@ -240,6 +279,12 @@ def xml_from_sections(input)
 
   sections = input.scan(RE_SECTION)
   # resulting in an array; each section is [section-label, nomarkdown-flag, section-text]
+  line = 1                      # skip "---"
+  sections.each do |section|
+    section << line
+    line += 1 + section[2].lines.count
+  end
+  # warn "#{line-1} lines"
 
   # the first section is a YAML with front matter parameters (don't put a label here)
   # We put back the "---" plus gratuitous blank lines to hack the line number in errors
@@ -259,12 +304,22 @@ def xml_from_sections(input)
     end
   end
 
+  if r = ENV["KRAMDOWN_RFC_DOCREV"]
+    warn "** building document revision -#{r}"
+    unless n = ps.has(:docname) and n.sub!(/-latest\z/, "-#{r}")
+      warn "** -d#{r}: docname #{n.inspect} doesn't have a '-latest' suffix"
+    end
+  end
+
   if o = ps[:'autolink-iref-cleanup']
     $options.autolink_iref_cleanup = o
   end
+  if o = ps[:'svg-id-cleanup']
+    $options.svg_id_cleanup = o
+  end
 
   coding_override = ps.has(:coding)
-  smart_quotes = ps[:smart_quotes]
+  smart_quotes = ps[:smart_quotes] || ps[:"smart-quotes"]
   typographic_symbols = ps[:typographic_symbols]
   header_kramdown_options = ps[:kramdown_options]
 
@@ -275,7 +330,7 @@ def xml_from_sections(input)
   # all the other sections are put in a Hash, possibly concatenated from parts there
   sechash = Hash.new{ |h,k| h[k] = ""}
   snames = []                   # a stack of section names
-  sections.each do |sname, nmdflag, text|
+  sections.each do |sname, nmdflag, text, line|
     # warn [:SNAME, sname, nmdflag, text[0..10]].inspect
     nmdin, nmdout = {
       "-" => ["", ""],          # stay in nomarkdown
@@ -286,7 +341,7 @@ def xml_from_sections(input)
     else
       snames.pop                # just "---" -> pop label (previous now current)
     end
-    sechash[snames.last] << "#{nmdin}#{text}#{nmdout}"
+    sechash[snames.last] << "#{nmdin}<?line #{line}?>\n#{text}#{nmdout}"
   end
 
   ref_replacements = { }
@@ -312,7 +367,7 @@ def xml_from_sections(input)
             anchor_to_bibref[k] = bibref
           end
           if dr = v.delete("display")
-            displayref[k] = dr
+            displayref[k.gsub("/", "_")] = dr
           end
         end
       end
@@ -328,18 +383,20 @@ def xml_from_sections(input)
     next if k == "fluff"
     v.gsub!(/{{(#{
       spacify_re(XSR_PREFIX)
-    })?(?:([?!])(-)?|(-))([\w._\-]+)(?:=([\w.\/_\-]+))?(#{
+    })?([\w.\/_\-]+@)?(?:([?!])(-)?|(-))([\w._\-]+)(?:=([\w.\/_\-]+))?(#{
+    #  2                 3     4    5   6              7
       XREF_TXT_SUFFIX
     })?(#{
       spacify_re(XSR_SUFFIX)
     })?}}/) do |match|
       xsr_prefix = $1
-      norminform = $2
-      replacing = $3 || $4
-      word = $5
-      bibref = $6
-      xrt_suffix = $7
-      xsr_suffix = $8
+      subref = $2
+      norminform = $3
+      replacing = $4 || $5
+      word = $6
+      bibref = $7
+      xrt_suffix = $8
+      xsr_suffix = $9
       if replacing
         if new = ref_replacements[word]
           word = new
@@ -363,7 +420,7 @@ def xml_from_sections(input)
       if norminform
         norm_ref[word] ||= norminform == '!' # one normative ref is enough
       end
-      "{{#{xsr_prefix}#{word}#{xrt_suffix}#{xsr_suffix}}}"
+      "{{#{xsr_prefix}#{subref}#{word}#{xrt_suffix}#{xsr_suffix}}}"
     end
   end
 
@@ -398,23 +455,48 @@ def xml_from_sections(input)
 
         bibref = anchor_to_bibref[k] || k
         bts, url = bibtagsys(bibref, k, stand_alone)
+        ann = v.delete("annotation") || v.delete("ann") if Hash === v
         if bts && (!v || v == {} || v.respond_to?(:to_str))
           if stand_alone
             a = %{{: anchor="#{k}"}}
+            a[-1...-1] = %{ ann="#{escape_html(ann, :attribute)}"} if ann
             sechash[sn.to_s] << %{\n#{NMDTAGS[0]}\n![:include:](#{bts})#{a}\n#{NMDTAGS[1]}\n}
           else
+            warn "*** please use standalone mode for adding annotations to references" if ann
             bts.gsub!('/', '_')
             (ps.rest["bibxml"] ||= []) << [bts, url]
             sechash[sn.to_s] << %{&#{bts};\n} # ???
           end
         else
+          if v.nil? && (bri = bibref.to_i) != 0
+            v = bri
+          end # hack in {{?Err6543=8610}}
+          if v && Integer === v
+            case href
+            when /\AErr(.*)/
+              epno = $1
+              rfcno = v.to_s
+              v = {
+                "target" => "https://www.rfc-editor.org/errata/eid#{epno}",
+                "title" => "RFC Errata Report #{epno}",
+                "quote-title" => false,
+                "seriesinfo" => { "RFC" => rfcno },
+                "date" => false
+              }
+            else
+              # superfluous -- would be caught by next "unless"
+              warn "*** don't know how to expand numeric ref #{k}"
+              next
+            end
+          end
           unless v && Hash === v
-            warn "*** don't know how to expand ref #{k}"
+            warn "*** don't know how to expand ref #{k} #{v.inspect}"
             next
           end
           if bts && !v.delete("override")
             warn "*** warning: explicit settings completely override canned bibxml in reference #{k}"
           end
+          v["ann"] = ann if ann
           sechash[sn.to_s] << KramdownRFC::ref_to_xml(href, v)
         end
       end
@@ -490,7 +572,7 @@ require 'ostruct'
 $options ||= OpenStruct.new
 op = OptionParser.new do |opts|
   opts.banner = <<BANNER
-Usage: kramdown-rfc2629 [options] file.md|file.mkd > file.xml
+Usage: kramdown-rfc2629 [options] [file.md] > file.xml
 Version: #{KDRFC_VERSION}
 BANNER
   opts.on("-V", "--version", "Show version and exit") do |v|
@@ -527,6 +609,10 @@ end
 warn "*** v2 #{$options.v2.inspect} v3 #{$options.v3.inspect}" if $options.verbose
 
 input = ARGF.read
+input.scrub! do |c|
+  warn "*** replaced invalid UTF-8 byte sequence #{c.inspect} by U+FFFD REPLACEMENT CHARACTER"
+  0xFFFD.chr(Encoding::UTF_8)
+end
 if input[0] == "\uFEFF"
    warn "*** There is a leading byte order mark. Ignored."
    input[0..0] = ''
@@ -537,7 +623,9 @@ if input[-1] != "\n"
 end
 process_includes(input) unless ENV["KRAMDOWN_SAFE"]
 input.gsub!(/^\{::boilerplate\s+(.*?)\}/) {
-  boilerplate($1)
+  bp = boilerplate($1)
+  delta = bp.lines.count
+  bp + "<?line -#{delta+1}?>\n"
 }
 if input =~ /[\t]/
    warn "*** Input contains HT (\"tab\") characters. Undefined behavior will ensue."
@@ -579,12 +667,23 @@ if $options.v3_used && !$options.v3
   $options.v3 = true
 end
 
-if $options.autolink_iref_cleanup
+# only reparse output document if cleanup actions required
+if $options.autolink_iref_cleanup || $options.svg_id_cleanup
   require 'rexml/document'
-  require 'kramdown-rfc/autolink-iref-cleanup'
 
   d = REXML::Document.new(output)
-  autolink_iref_cleanup(d)
+  d.context[:attribute_quote] = :quote  # Set double-quote as the attribute value delimiter
+
+  if $options.autolink_iref_cleanup
+    require 'kramdown-rfc/autolink-iref-cleanup'
+    autolink_iref_cleanup(d)
+  end
+
+  if $options.svg_id_cleanup
+    require 'kramdown-rfc/svg-id-cleanup'
+    svg_id_cleanup(d)
+  end
+
   output = d.to_s
 end
 

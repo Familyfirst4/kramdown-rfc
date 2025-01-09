@@ -99,14 +99,23 @@
        mail_local, mail_host = mail.split("@", 2)
      end
      if mail_host -%>
-<%     mail_subdomain, mail_domain = mail_host.split(".", 2) -%>
-<%     group = venue[:group] || mail_local # XXX -%>
-<%     arch = venue[:arch] || "https://mailarchive.ietf.org/arch/browse/#{mail_local}/" -%>
-<%     GROUPS = {"ietf" => "Working ", "irtf" => "Research "} -%>
-<%     gtype ||= "#{GROUPS[mail_subdomain]}Group" -%>
+<%     default_links = {
+                         "iab.org" => true,
+                         "ietf.org" => true,
+                         "irtf.org" => true,
+                       }[mail_host]
+       mail_subdomain, mail_domain = mail_host.split(".", 2)
+       group = venue[:group] || mail_local # XXX
+       arch = venue[:arch] || default_links && "https://mailarchive.ietf.org/arch/browse/#{mail_local}/"
+       subscribe = venue[:subscribe] || default_links && "https://www.ietf.org/mailman/listinfo/#{mail_local}/"
+       GROUPS = {"ietf" => "Working ", "irtf" => "Research "}
+       gtype ||= "#{GROUPS[mail_subdomain]}Group" -%>
         Discussion of this document takes place on the
-        <%=group%> <%=gtype%> mailing list (<eref target="mailto:<%=mail%>"/>),
-        which is archived at <eref target="<%=arch%>"/>.
+        <%=group%> <%=gtype%> mailing list (<eref target="mailto:<%=mail%>"/>)<% if arch -%>,
+        which is archived at <eref target="<%=arch%>"/><% end -%>.
+<% if subscribe -%>
+        Subscribe at <eref target="<%=subscribe%>"/>.
+<% end -%>
 <%   end -%>
 <%   if homepage -%>
         <%=gtype%> information can be found at <eref target="<%=homepage%>"/>.
@@ -154,6 +163,7 @@
 {:/nomarkdown}
 {:quote: gi="blockquote"}
 {:aside: gi="aside"}
+{:cref: gi="cref"}
 {:markers: sourcecode-markers="true"}
 {:unnumbered: numbered="false"}
 {:vspace: vspace="0"}
@@ -173,20 +183,32 @@
     <displayreference target="<%=k%>" to="<%=v%>"/>
 <% end -%>
 
-<% if sh = sechash.delete("normative") -%>
-    <references title='Normative References'>
+<% shn = sechash.delete("normative")
+   shi = sechash.delete("informative")
+   shc = shn && shi
+   if shc
+-%>
+<references title='References' anchor="sec-combined-references">
+<% end -%>
 
-<%= sh %>
+<% if shn -%>
+    <references title='Normative References' anchor="sec-normative-references">
+
+<%= shn %>
 
     </references>
 <% end -%>
 
-<% if sh = sechash.delete("informative") -%>
-    <references title='Informative References'>
+<% if shi -%>
+    <references title='Informative References' anchor="sec-informative-references">
 
-<%= sh %>
+<%= shi %>
 
     </references>
+<% end -%>
+
+<% if shc -%>
+</references>
 <% end -%>
 
 <%= sechash.delete("back") %>
@@ -203,6 +225,7 @@
 <%= sh -%>
 <% if $options.v3 && consec
      ps.arr("contributor") do |au|
+      if Hash === au
        aups = KramdownRFC::authorps_from_hash(au)
    -%>
 <%= KramdownRFC::person_element_from_aups("contact", aups) -%>
@@ -215,7 +238,17 @@
 CONTRIBUTION
     end -%>
 <%   aups.warn_if_leftovers  -%>
+<%   else -%>
+<%=  <<TEXT
+{:/nomarkdown}
+
+#{au}
+
+{::nomarkdown}
+TEXT
+-%>
 <%   end -%>
+<%  end -%>
 <% end -%>
     </section>
 <% end -%>

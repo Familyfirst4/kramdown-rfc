@@ -1,4 +1,45 @@
+
+# Note that this doesn't attempt to handle HT characters
+def remove_indentation(s)
+  l = s.lines
+  indent = l.grep(/\S/).map {|l| l[/^\s*/].size}.min
+  l.map {|li| li.sub(/^ {0,#{indent}}/, "")}.join
+end
+
+def trim_empty_lines_around(s)  # this deletes the trailing newline, which may need to be reconstructed
+  s.sub(/\A(\r?\n)*/, '').sub(/(\r?\n)*\z/, '')
+end
+
+def fix_unterminated_line(s)
+  s.sub(/[^\n]\z/) { "#$&\n" } # XXX
+end
+
+def handle_artwork_sourcecode(s, unfold = true)
+  s = trim_empty_lines_around(s)
+  s = unfold8792(s) if unfold
+  fix_unterminated_line(s)
+end
+
 FOLD_MSG = "NOTE: '\\' line wrapping per RFC 8792".freeze
+UNFOLD_RE = /\A.*#{FOLD_MSG.sub("\\", "(\\\\\\\\\\\\\\\\?)")}.*\n\r?\n/
+
+def unfold8792(s)
+  if s =~ UNFOLD_RE
+    indicator = $1
+    s = $'
+    sub = case indicator
+          when "\\"
+            s.gsub!(/\\\n[ \t]*/, '')
+          when "\\\\"
+            s.gsub!(/\\\n[ \t]*\\/, '')
+          else
+            fail "indicator"    # Cannot happen
+          end
+    warn "** encountered RFC 8792 header without folded lines" unless sub
+  end
+  s
+end
+
 MIN_FOLD_COLUMNS = FOLD_MSG.size
 FOLD_COLUMNS = 69
 RE_IDENT = /\A[A-Za-z0-9_]\z/
