@@ -1,0 +1,275 @@
+#!/usr/bin/env ruby -KU
+# frozen_string_literal: true
+
+# List Section References from a RFCXML document
+#
+# (PoC, in urgent need of refactoring)
+# Requires xml2rfc and tidy commands in path
+# Use without open-uri-cached is untested
+
+require 'rexml/document'
+require 'yaml'
+require 'json'
+require 'shellwords'
+require 'fileutils'
+begin
+  require 'open-uri/cached'
+rescue LoadError
+  warn '*** please "gem install open-uri-cached" to enable caching'
+  require 'open-uri'
+end
+require_relative '../lib/kramdown-rfc/rexml-all-text.rb'
+
+target = :shortname
+require 'optparse'
+begin
+  op = OptionParser.new do |opts|
+    opts.banner = "Usage: kramdown-rfc-lsr [options] xml-source"
+    opts.on("-u", "--url", "Source is URL") do |v|
+      target = :url
+    end
+    opts.on("-s", "--shortname", "Source is shortname (default)") do |v|
+      target = :shortname
+    end
+    opts.on("-f", "--file", "Source is filename") do |v|
+      target = :file
+    end
+  end
+  op.parse!
+rescue Exception => e
+  warn e
+  exit 1
+end
+
+$exit_code = 0
+
+if target != :file && ARGV.size != 1
+  puts op
+  exit 1
+end
+xmlsource = ARGV[0]
+if target == :shortname
+  xmlsource = case xmlsource
+              when /^(?:rfc)?(\d+)$/i
+                "https://www.rfc-editor.org/rfc/rfc#{$1.to_i.to_s}.xml"
+              when /^(?:draft-|I-D.|)(.*-\d\d)$/
+                "https://www.ietf.org/archive/id/draft-#$1.xml"
+              # XXX find xml source for most recent version!
+              else
+                warn "*** Can't parse shortname #{xmlsource.inspect}"
+                puts op
+                exit 1
+              end
+  target = :url
+end
+
+begin
+  xml = case target
+        when :file
+          ARGF.read
+        when :url
+          URI(xmlsource).open.read
+        else
+          fail
+        end
+rescue Exception => e
+  warn "#{xmlsource.inspect}: #{e}"
+  exit 1
+end
+
+doc = REXML::Document.new(xml)
+
+REXML::XPath.match(doc.root, '//xi:include').each do |el|
+  begin
+    refdoc = REXML::Document.new(URI(el[:href]).open.read)
+    el.replace_with(refdoc.root)
+  rescue => e
+    warn "*** error getting xinclude #{el} resolved: #{e}"
+  end
+end
+
+def series_info_to_URI(si)
+  case si[:name]
+  when "RFC"
+    "https://www.rfc-editor.org/rfc/rfc#{si[:value]}.xml"
+  when "Internet-Draft"
+    "https://www.ietf.org/archive/id/#{si[:value]}.xml"
+  end
+end
+
+
+def series_info_to_name(si)
+  case si[:name]
+  when "RFC"
+    "RFC#{si[:value]}"
+  when "Internet-Draft"
+    si[:value]
+  end
+end
+
+def section_number_to_pn_candidates(s)
+  if /^[0-9]/ =~ s
+    ["section-#{s}"]
+  elsif /[.]/ =~ s
+    ["section-#{s.downcase}", "section-appendix.#{s.downcase}"]
+  else
+    ["section-appendix.#{s.downcase}"]
+  end
+end
+
+def section_number_to_htmlid(s)
+  if /^[0-9]/ =~ s
+    "section-#{s}"
+  else
+    "appendix-#{s.upcase}"
+  end
+end
+
+references = Hash[REXML::XPath.match(doc.root, "//reference").map {|r|
+                    si = REXML::XPath.match(r, "seriesInfo").map {|s|
+                      series_info_to_URI(s)}.compact.first
+                    sn = REXML::XPath.match(r, "seriesInfo").map {|s|
+                      series_info_to_name(s)}.compact.first
+                    [r[:anchor], si ? [si, sn] : nil]
+}]                              # XXX duplicates?
+
+heading1 = "# #{xmlsource}"
+title = REXML::XPath.first(doc.root, "//title")
+heading1 << "\n(#{title.all_text})" if title
+puts heading1
+
+per_reference = Hash.new { |h, k| h[k] = Set[]}
+
+REXML::XPath.each(doc.root, "//xref[@section]") do |x|
+  trg = x[:target]
+  if x[:relative]
+    puts "\n## #{x[:target]}#{x[:relative]}: #{x[:section]}"
+  else
+    # p x
+    per_reference[trg] << x[:section]
+  end
+end
+
+def error_out(s)
+  warn ""
+  warn s
+  warn ""
+  $exit_code = 1
+end
+
+def num_expand(s)
+  s.gsub(/\d+/) {|n| "%09d" % n.to_i}
+end
+
+def want_one(secs, what)
+  case secs.size
+  when 0
+    error_out "*** cannot match #{what}"
+    "*** DOESN'T EXIST ***"
+  when 1
+    yield secs.first
+  else
+    error_out "*** multiple matches for #{what}"
+    "*** MULTIPLE MATCHES ***"
+  end
+end
+require 'open3'
+
+module OpenURI
+  class << self
+    def processed(uri, old, camo, *rest)
+      newuri = uri.to_s.sub(old, camo) # camo name for processed data
+      response = Cache.get(newuri) || (
+        unprocessed = open_uri(uri, *rest).read
+        fn = [OpenURI::Cache.cache_path, uri.sub(/.*\//, '')].join('/')
+        File.open(fn, 'wb'){|f| f.write unprocessed }
+        new_fn = yield newuri, fn
+        Cache.set(newuri, File.open(new_fn))
+      )
+      response
+    end
+    def prepped(uri)
+      processed(uri, /\.xml$/, ".prepped.xml") do |newuri, fn|
+        _prep_out, s = Open3.capture2("xml2rfc", "--prep", fn)
+        fail s.inspect unless s.success?
+        fn.sub(/\.xml$/, ".prepped.xml") # xml2rfc creates new file
+      end
+    end
+    def tidied(uri)
+      processed(uri, /\.html$/, ".tidied.html") do |newuri, fn|
+        _prep_out, s = Open3.capture2("tidy", "-mq", "-asxml", "-f", "/dev/null", fn)
+        fail s.inspect unless s.exited? # can't check success
+        fn                              # -m makes in-place change
+      end
+    end
+  end
+end
+
+# go through section-referenced documents in sequence
+per_reference.keys.sort_by {|x| num_expand(x)}.each do |trg|
+  uri, sname = references[trg]
+  add = +''
+  if sname != trg
+    add << " [#{sname}]"
+  end
+  begin
+    ref = URI(uri).open.read
+    refdoc = REXML::Document.new(ref)
+    if REXML::XPath.match(refdoc.root, "/rfc/front/abstract[@pn]").size == 0
+      ref = OpenURI.prepped(uri).read
+      refdoc = REXML::Document.new(ref)
+      add << " [+prep]"
+    end
+    add << " (#{REXML::XPath.match(refdoc.root, "//title").first.all_text})"
+  rescue OpenURI::HTTPError => e
+    begin
+      jsonuri = uri.sub(/\.xml$/, ".json")
+      refjson = URI(jsonuri).open.read
+      refdata = JSON.load(refjson)
+      add << " (#{refdata["title"].strip})"
+    rescue OpenURI::HTTPError => e
+      add << " [No XML or JSON]"
+    rescue Exception => e
+      warn "*** error getting #{jsonuri.inspect}: #{e}"
+    end
+  rescue Exception => e
+    warn "*** error getting #{uri.inspect}: #{e}"
+  end
+  puts "\n## #{trg}#{add}"
+  unless refdoc
+    begin
+      htmluri = uri.sub(/\.xml$/, ".html")
+      refhtml = OpenURI.tidied(htmluri).read
+      refhtmldoc = REXML::Document.new(refhtml)
+    rescue Exception => e
+      warn "*** error tidying up HTML for #{htmluri.inspect}: #{e}"
+    end
+  end
+  # go through individual section references in sequence
+  per_reference[trg].to_a.sort_by {|x| num_expand(x)}.each do |s|
+    add = +''
+    if refdoc      # find section name in XML from anchor s
+      secpn = section_number_to_pn_candidates(s)
+      secs = secpn.flat_map{ |c|
+        REXML::XPath.match(refdoc.root, "//section[@pn=$pn]",
+                           {}, {"pn" => c})}
+      what = "#{secpn.join(" or ")} in #{trg}"
+      add << " (#{want_one(secs, what) do |sec|
+                    sec[:title] || sec.elements["name"].all_text
+                  end})"
+    elsif refhtmldoc      # find section name in HTML from anchor s
+      secpn = section_number_to_htmlid(s)
+      secs = REXML::XPath.match(refhtmldoc.root,
+                                "//xmlns:a[@id=$pn]/ancestor::xmlns:span",
+                                {"xmlns" => "http://www.w3.org/1999/xhtml"},
+                                {"pn" => secpn})
+      what = "#{secpn} in #{trg}"
+      add << " (#{want_one(secs, what) do |sec|
+                    sec.text.sub(/^\.\s+/, '')
+                  end})"
+    end
+    puts "* #{/^[0-9]/ =~ s ? "Section" : "Appendix"} #{s}#{add}"
+  end
+end
+
+exit $exit_code

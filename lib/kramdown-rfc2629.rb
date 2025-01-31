@@ -22,6 +22,9 @@ require 'open3'                 # for math
 require 'json'                  # for math
 require 'rexml/document'        # for SVG and bibxml acrobatics
 
+require 'kramdown-rfc/doi'      # for fetching information for a DOI
+require 'kramdown-rfc/rfc8792'
+
 class Object
   def deep_clone
     Marshal.load(Marshal.dump(self))
@@ -29,6 +32,54 @@ class Object
 end
 
 module Kramdown
+  RFCXML_SPAN_ELEMENTS = Set.new(Kramdown::Parser::Html::Constants::HTML_SPAN_ELEMENTS)
+
+  Kramdown::Options.define(:ol_start_at_first_marker, Kramdown::Options::Boolean, false, <<~EOF)
+      If this option is `true`, an ordered list (<ol) will use the
+      number in its first marker (1 for 1. etc.) as the default value
+      of the start= attribute.
+
+      Default: false (for backward compatibility)
+      Used by: RFCXML converter
+    EOF
+
+  Kramdown::Options.define(:nested_ol_types, Object, %w[1], <<~EOF) do |val|
+      Values for type= attribute for nested ordered lists (ol).
+      The value needs to be an array of <ol type= values, expressed as one of:
+      1. A YAML array
+      2. A string that will be split on commas (with optional blank space following)
+      3. A string that will be split on blank space
+
+      Default: ["1"]
+      Used by: RFCXML converter
+    EOF
+    val = case val
+          when String
+            if val[0] == "[" && val[-1] == "]"
+              begin
+                val = YAML.safe_load(val)
+              rescue Psych::SyntaxError
+                warn "** YAML syntax error in nested_ol_types=#{val.inspect}"
+                val = %w[1]
+              end
+            else
+              val = val.split(/, */)
+              val = val[0].split(/ +/) if val.size == 1
+            end
+            Kramdown::Options.simple_array_validator(val, :nested_ol_types)
+          when Array
+            val.map!{ |x| x.to_s }
+            val = Kramdown::Options.simple_array_validator(val, :nested_ol_types)
+          else
+            raise Kramdown::Error, "Invalid value for option '#{:nested_ol_types}': '#{val.inspect}'"
+          end
+    if val == []
+      val = %w[1]
+      warn "** Option #{:nested_ol_types} cannot be empty, defaulting to #{val.inspect}"
+    end
+    val
+  end
+
 
   module Parser
 
@@ -39,8 +90,8 @@ module Kramdown
           sorted_abbrevs = @root.options[:abbrev_defs].keys.sort {|a, b| b.length <=> a.length }
           regexps = [Regexp.union(*sorted_abbrevs.map {|k|
                                     /#{Regexp.escape(k).gsub(/\\\s/, "[\\s\\p{Z}]+").force_encoding(Encoding::UTF_8)}/})]
-          # warn regexps.inspect
           regexps << /(?=(?:\W|^)#{regexps.first}(?!\w))/ # regexp should only match on word boundaries
+          # warn regexps.inspect
         end
         super(el, regexps)
       end
@@ -75,6 +126,11 @@ module Kramdown
         href.gsub(/\A(?:[0-9]|section-|u-|figure-|table-|iref-)/) { "_#{$&}" }
       end
 
+      def rfc_mention(target1)  # only works for RFCnnnn
+        target1 =~ /\A([A-Z]*)(.*)\z/
+        "#$1 #$2 "
+      end
+
       def handle_bares(s, attr, format, href, last_join = nil)
         if s.match(/\A(#{XREF_ANY}) and (#{XREF_ANY})\z/)
           handle_bares($1, {}, nil, href, " and ")
@@ -83,13 +139,14 @@ module Kramdown
         end
 
         href = href.split(' ')[0] # Remove any trailing (...)
+        target1, target2 = href.split("@", 2)
         multi = last_join != nil
         (sn, s) = s.split(' ', 2)
         loop do
           m = s.match(/\A#{XREF_RE_M}(, (?:and )?| and )?/)
           break if not m
 
-          if not multi and not m[2] and not m[3]
+          if not multi and not m[2] and not m[3] and not target2
             # Modify |attr| if there is a single reference.  This can only be
             # used if there is only one section reference and the section part
             # has no title.
@@ -107,9 +164,13 @@ module Kramdown
           multi = true
           s[m[0]] = ''
 
-          attr1 = { 'target' => href, 'section' => m[1], 'sectionFormat' => 'bare', 'text' => m[2] }
+          attr1 = { 'target' => target1, 'section' => m[1], 'sectionFormat' => 'bare', 'text' => m[2] }
           @tree.children << Element.new(:xref, nil, attr1)
-          @tree.children << Element.new(:text, m[3] || last_join || " of ", {})
+          andof = m[3] || last_join || " of "
+          if andof == " of " && target2
+            andof += rfc_mention(target1)
+          end
+          @tree.children << Element.new(:text, andof, {})
         end
       end
 
@@ -132,18 +193,22 @@ module Kramdown
         else
           href = @src[3]
           attr = {}
+          handled_subref = false
           if $options.v3
             # match Section ... of ...; set section, sectionFormat
             case href.gsub(/[\u00A0\s]+/, ' ') # may need nbsp and/or newlines
             when /\A(#{SECTIONS_RE}) of (.*)\z/
               href = $2
               handle_bares($1, attr, "of", href)
+              handled_subref = true
             when /\A(.*), (#{SECTIONS_RE})\z/
               href = $1
               handle_bares($2, attr, "comma", href)
+              handled_subref = true
             when /\A(.*) \((#{SECTIONS_RE})\)\z/
               href = $1
               handle_bares($2, attr, "parens", href)
+              handled_subref = true
             when /#{XREF_RE_M}<(.+)\z/
               href = $3
               if $2
@@ -164,6 +229,13 @@ module Kramdown
           if href.match(/#{XREF_RE_M}\z/)
             href = $1
             attr['text'] = $2
+          end
+          target1, target2 = href.split("@", 2) # should do this only for sectionref...
+          if target2
+            href = target2
+            unless handled_subref
+              @tree.children << Element.new(:text, rfc_mention(target1), {})
+            end
           end
           href = self.class.idref_cleanup(href)
           attr['target'] = href
@@ -258,6 +330,9 @@ module Kramdown
         if anchor = a.delete('href')
           a['target'] = ::Kramdown::Parser::RFC2629Kramdown.idref_cleanup(anchor)
         end
+        if lang = a.delete('lang-')
+          a['xml:lang'] = lang
+        end
         if av = a.delete('noabbrev')      # pseudo attribute -> opts
           opts = opts.merge(noabbrev: TRUTHY[av]) # updated copy
         end
@@ -310,15 +385,28 @@ module Kramdown
       def initialize(*doc)
         super
         @sec_level = 1
+        @location_delta = 100000 # until reset
+        @location_correction = 0 # pre-scanning corrections
         @in_dt = 0
         @footnote_names_in_use = {}
       end
 
-      def convert(el, indent = -INDENTATION, opts = {})
+      def correct_location(location)
+        location + @location_delta + @location_correction
+      end
+
+      def convert(el)
+        opts = el.options[:options]
+        # warn "** tree opts #{opts.inspect}"
+        if nested_ol_types = @options[:nested_ol_types]
+          opts[:nested_ol_types] ||= nested_ol_types
+          # warn "** tree opts out #{opts.inspect}"
+        end
+        indent = -INDENTATION
         if el.children[-1].type == :raw
           raw = convert1(el.children.pop, indent, opts)
         end
-        "#{convert1(el, indent, opts)}#{end_sections(1, indent)}#{raw}"
+        "#{convert1(el, indent, opts)}#{end_sections(1, indent, el.options[:location])}#{raw}"
       end
 
       def convert1(el, indent, opts = {})
@@ -358,10 +446,19 @@ module Kramdown
         generate_id(value).gsub(/-+/, '-')
       end
 
-      def self.process_markdown(v)             # Uuh.  Heavy coupling.
+      def self.process_markdown1(v)             # Uuh.  Heavy coupling.
         doc = ::Kramdown::Document.new(v, $global_markdown_options)
         $stderr.puts doc.warnings.to_yaml unless doc.warnings.empty?
-        doc.to_rfc2629[3..-6] # skip <t>...</t>\n
+        doc.to_rfc2629
+      end
+
+      def self.process_markdown(v)
+        process_markdown1(v)[3..-6] # skip <t>...</t>\n
+      end
+
+      def self.process_markdown_to_rexml(v)
+        s = process_markdown1(v)
+        REXML::Document.new(s)
       end
 
       SVG_COLORS = Hash.new {|h, k| k}
@@ -454,7 +551,7 @@ COLORS
 
       def memoize(meth, *args)
         require 'digest'
-        Dir.mkdir(REFCACHEDIR) unless Dir.exists?(REFCACHEDIR)
+        Dir.mkdir(REFCACHEDIR) unless Dir.exist?(REFCACHEDIR)
         kdrfc_version = Gem.loaded_specs["kramdown-rfc2629"].version.to_s.gsub('.', '_') rescue "UNKNOWN"
         fn = "#{REFCACHEDIR}/kdrfc-#{kdrfc_version}-#{meth}-#{Digest::SHA256.hexdigest(Marshal.dump(args))[0...40]}.cache"
         begin
@@ -504,6 +601,7 @@ COLORS
           elsif t == "protocol-aasvg"
             result1, err, _s = Open3.capture3("#{DEFAULT_AASVG}#{svg_opt}", stdin_data: result);
             dont_clean = true
+            dont_check = true
           else
             result1 = nil
           end
@@ -513,6 +611,7 @@ COLORS
         when "aasvg"
           result1, err, _s = Open3.capture3("#{DEFAULT_AASVG}#{svg_opt}", stdin_data: result);
           dont_clean = true
+          dont_check = true
         when "ditaa"        # XXX: This needs some form of option-setting
           result1, err, _s = Open3.capture3("ditaa #{file.path} --svg -o -#{svg_opt}", stdin_data: result);
         when "mscgen"
@@ -522,20 +621,42 @@ COLORS
           outpath = file.path + ".svg"
           result1 = File.read(outpath) rescue '' # don't die before providing error message
           File.unlink(outpath) rescue nil        # ditto
-        when "plantuml", "plantuml-utxt"
+        when "plantuml", "plantuml-utxt", "plantuml-ascii-art"
+          if t == "plantuml-ascii-art"
+            result, ascii_art = result.split(/^~{3,} ascii-art\n/, 2)
+            unless ascii_art
+              warn "*** Didn't find ascii-art in plantuml-ascii-art #{result.inspect}"
+              ascii_art = result.to_s
+            end
+          end
           plantuml = "@startuml\n#{result}\n@enduml"
           result1, err, _s = Open3.capture3("plantuml -pipe -tsvg#{svg_opt}", stdin_data: plantuml);
-          result, err1, _s = Open3.capture3("plantuml -pipe -tutxt#{txt_opt}", stdin_data: plantuml) if t == "plantuml-utxt"
-          err << err1.to_s
+          case t
+          when "plantuml-utxt"
+            result, err1, _s = Open3.capture3("plantuml -pipe -tutxt#{txt_opt}", stdin_data: plantuml)
+            err << err1.to_s
+          when "plantuml-ascii-art"
+            result = ascii_art
+          end
         when "railroad", "railroad-utf8"
           result1, err1, _s = Open3.capture3("kgt -l abnf -e svg#{svg_opt}", stdin_data: result);
           result1 = svg_clean_kgt(result1); dont_clean = true
           result, err, _s = Open3.capture3("kgt -l abnf -e rr#{t == "railroad" ? "text" : "utf8"}#{txt_opt}",
                                             stdin_data: result);
           err << err1.to_s
-        when "math"
+        when "math", "math-asciitex"
           result1, err, _s = Open3.capture3("tex2svg --font STIX --speech=false#{svg_opt} #{Shellwords.escape(' ' << result)}");
-          result, err1, _s = Open3.capture3("asciitex -f #{file.path}#{txt_opt}")
+          begin
+            raise Errno::ENOENT if t == "math-asciitex"
+            result, err1, s = Open3.capture3("utftex -m #{txt_opt}", stdin_data: result)
+            if s.exitstatus != 0
+              warn "** utftex: #{err1.inspect}"
+              raise Errno::ENOENT
+            end
+          rescue Errno::ENOENT
+            warn "** utftex not working, falling back to asciitex" unless t == "math-asciitex"
+            result, err1, _s = Open3.capture3("asciitex -f #{file.path}#{txt_opt}")
+          end
           err << err1
         end
         capture_croak(t, err)
@@ -545,7 +666,11 @@ COLORS
         if result1
           result1 = svg_clean(result1) unless dont_clean
           unless dont_check
-            result1, err, _s = Open3.capture3("svgcheck -Xqa", stdin_data: result1);
+            file = Tempfile.new("kramdown-rfc")
+            file.write(result1)
+            file.close
+            result1, err, _s = Open3.capture3("svgcheck -qa #{file.path}");
+            file.unlink
             # warn ["svgcheck:", result1.inspect]
             capture_croak("svgcheck", err)
           end
@@ -605,8 +730,8 @@ COLORS
           end
           case t
           when "aasvg", "ditaa", "goat",
-               "math", "mermaid",  "mscgen",
-               "plantuml", "plantuml-utxt",
+               "math", "math-asciitex", "mermaid",  "mscgen",
+               "plantuml", "plantuml-utxt", "plantuml-ascii-art",
                "protocol", "protocol-aasvg", "protocol-goat",
                "railroad", "railroad-utf8"
             if gi
@@ -636,34 +761,84 @@ COLORS
               if anchor = el.attr['anchor']
                 "##{anchor}"
               elsif lineno = el.options[:location]
-                "approx. line #{lineno}" # XXX
+                "#{correct_location(lineno)}"
               else
                 "UNKNOWN"
               end
+            preprocs = el.attr.delete("pre")
+            checks = el.attr.delete("check")
+            postprocs = el.attr.delete("post")
             case t
+            when "cbor"
+              warn "** There is no sourcecode-type “cbor”."
+              warn "**   Do you mean “cbor-diag” (diagnostic notation)"
+              warn "**   or “cbor-pretty” (annotated hex-dump)?"
             when "json"
-              begin
-                JSON.load(result)
-              rescue => e
-                err1 = "*** #{loc_str}: JSON isn't: #{e.message[0..40]}\n"
-                begin
-                  JSON.load("{" << result << "}")
-                rescue => e
-                  warn err1 << "***  not even with braces added around: #{e.message[0..40]}"
-                end
-              end
-            when "json-from-yaml"
-              begin
-                y = YAML.safe_load(result, aliases: true, filename: loc_str)
-                result = JSON.pretty_generate(y)
-                t = "json"      # XXX, this could be another format!
-              rescue => e
-                warn "*** YAML isn't: #{e.message}\n"
-              end
+              checks ||= "json"
+            when /\A(.*)-from-yaml\z/
+              t = $1
+              preprocs ||= "yaml2json"
             end
+            preprocs = (preprocs || '').split("-")
+            checks = (checks || '').split("-")
+            postprocs = (postprocs || '').split("-")
+            result = sourcecode_checkproc(preprocs, checks, postprocs, loc_str, result)
             "#{' '*indent}<figure#{el_html_attributes(el)}><#{gi}#{html_attributes(artwork_attr)}><![CDATA[#{result}#{result =~ /\n\Z/ ? '' : "\n"}]]></#{gi}></figure>\n"
           end
         end
+      end
+
+      def sourcecode_proc(proc, loc_str, result)
+        case proc
+        when "dedent"
+          result = remove_indentation(result)
+        when /\Afold(\d*)(left(\d*))?(dry)?\z/
+          fold = [$1.to_i,            # col 0 for ''
+                  ($3.to_i if $2),    # left 0 for '', nil if no "left"
+                  $4]                 # dry
+          result = fix_unterminated_line(fold8792_1(trim_empty_lines_around(result), *fold)) # XXX
+        when "yaml2json"
+          begin
+            y = YAML.safe_load(result, aliases: true, filename: loc_str)
+            result = JSON.pretty_generate(y)
+          rescue => e
+            warn "*** #{loc_str}: YAML isn't: #{e.message}\n"
+          end
+        else
+          warn "*** #{loc_str}: unknown proc '#{proc}'"
+        end
+        result
+      end
+
+      def sourcecode_checkproc(preprocs, checks, postprocs, loc_str, result)
+        preprocs.each do |proc|
+          result = sourcecode_proc(proc, loc_str, result)
+        end if preprocs
+        check_input = result
+        checks.each do |check|
+          case check
+          when "skipheader"
+            check_input = handle_artwork_sourcecode(check_input).sub(/.*?\n\n/m, '')
+          when "json"
+            # check for 8792; undo if needed:
+            begin
+              JSON.load(handle_artwork_sourcecode(check_input))
+            rescue => e
+              err1 = "*** #{loc_str}: JSON isn't: #{JSON.dump(e.message[0..40])}\n"
+              begin
+                JSON.load("{" << check_input << "}")
+              rescue => e
+                warn err1 << "***  not even with braces added around: #{JSON.dump(e.message[0..40])}"
+              end
+            end
+          else
+            warn "*** #{loc_str}: unknown check '#{check}'"
+          end
+        end if checks
+        postprocs.each do |proc|
+          result = sourcecode_proc(proc, loc_str, result)
+        end if postprocs
+        result
       end
 
       def mk_artwork(artwork_attr, typ, content)
@@ -675,7 +850,12 @@ COLORS
         if $options.v3
           gi = el.attr.delete('gi')
           if gi && gi != 'ul'
-            "#{' '*indent}<#{gi}#{el_html_attributes(el)}>\n#{text}#{' '*indent}</#{gi}>\n"
+            if RFCXML_SPAN_ELEMENTS === gi
+              text.sub!(/\A\s*<t>(.*)<\/t>\s*\z/) {$1} # XXX unwrap inner text from block
+              "#{' '*indent}<t><#{gi}#{el_html_attributes(el)}>#{text}</#{gi}></t>\n"
+            else
+              "#{' '*indent}<#{gi}#{el_html_attributes(el)}>\n#{text}#{' '*indent}</#{gi}>\n"
+            end
           else
             "#{' '*indent}<ul#{el_html_attributes_with(el, {"empty" => 'true'})}><li>\n#{text}#{' '*indent}</li></ul>\n"
           end
@@ -685,7 +865,7 @@ COLORS
         end
       end
 
-      def end_sections(to_level, indent)
+      def end_sections(to_level, indent, location)
         if indent < 0
           indent = 0
         end
@@ -694,7 +874,7 @@ COLORS
           @sec_level = to_level
           "#{' '*indent}</section>\n" * delta
         else
-          $stderr.puts "Incorrect section nesting: Need to start with 1"
+          $stderr.puts "** #{correct_location(location)}: Bad section nesting: start heading level at 1 and increment by 1"
         end
       end
 
@@ -708,6 +888,23 @@ COLORS
           irefs << md[2]        # breaks for spanx... don't emphasize in headings!
         end
         [clean, irefs]
+      end
+
+      def clean_pcdatav3(parts) # hack, will become unnecessary with v3 tables
+        clean = ''
+        parts.each do |p|
+          next if p.empty?
+          if p == "<br />"
+            p = "\u2028"        # XXX
+          end
+          d = REXML::Document.new("<foo>#{p}</foo>")
+          t = REXML::XPath.each(d.root, "//text()").to_a.join
+          if t != p
+            warn "** simplified markup #{p.inspect} into #{t.inspect} in table heading"
+          end
+          clean << t
+        end
+        clean
       end
 
       def convert_header(el, indent, opts)
@@ -732,7 +929,7 @@ COLORS
         clean, irefs = clean_pcdata(inner_a(el, indent, opts))
         el.attr['title'] = clean
         end
-        "#{end_sections(el.options[:level], indent)}#{' '*indent}<section#{@sec_level += 1; el_html_attributes(el)}>#{irefs}\n"
+        "#{end_sections(el.options[:level], indent, el.options[:location])}#{' '*indent}<section#{@sec_level += 1; el_html_attributes(el)}>#{irefs}\n"
       end
 
       def convert_hr(el, indent, opts) # misuse for page break
@@ -750,7 +947,26 @@ COLORS
           "#{' '*indent}<t><list#{attrstring}>\n#{inner(el, indent, opts)}#{' '*indent}</list></t>\n"
         end
       end
-      alias :convert_ol :convert_ul
+
+      def convert_ol(el, indent, opts)
+        if @options[:ol_start_at_first_marker] and (first_list_marker =
+                                                    el.options[:first_list_marker])
+          el.attr['start'] ||= first_list_marker[/\d+/]
+        end
+        nested_types = opts[:nested_ol_types] || ["1"]
+        # warn "** ol opts #{opts.inspect} types #{nested_types.inspect}"
+        if nested_attr = el.attr.delete('nestedOlTypes')
+          nested_types = ::Kramdown::Options.parse(:nested_ol_types, nested_attr)
+        end
+        if nested_types = nested_types.dup
+          # warn "** nested_types #{nested_types.inspect}"
+          nested_here = nested_types.shift
+          opts = opts.merge(nested_ol_types: nested_types << nested_here)
+          el.attr['type'] ||= nested_here
+          # warn "** actual ol type #{el.attr['type'].inspect}"
+        end
+        convert_ul(el, indent, opts)
+      end
 
       def convert_dl(el, indent, opts)
         if $options.v3
@@ -849,6 +1065,15 @@ COLORS
       end
 
       def convert_xml_comment(el, indent, opts)
+        if el.value =~ /\A<\?line (([-+]?)[0-9]+)\?>\z/
+          lineno = $1.to_i
+          case $2
+          when ''               # absolute
+            @location_delta = lineno - el.options[:location]
+          when '+', '-'         # correction (pre-scanning!)
+            @location_correction += lineno
+          end
+        end
         if el.options[:category] == :block && !el.options[:parent_is_raw]
           ' '*indent + el.value + "\n"
         else
@@ -888,8 +1113,13 @@ COLORS
           end
         end
         if alignment
-          res, irefs = clean_pcdata(inner_a(el, indent, opts))
-          warn "*** lost markup #{irefs} in table heading" unless irefs.empty?
+          xmlres = inner_a(el, indent, opts)
+          if $options.v3
+            res = clean_pcdatav3(xmlres)
+          else
+            res, irefs = clean_pcdata(xmlres)
+            warn "*** lost markup #{irefs} in table heading" unless irefs.empty?
+          end
           "#{' '*indent}<ttcol #{widthopt}align='#{alignment}'#{el_html_attributes(el)}>#{res.empty? ? "&#160;" : res}</ttcol>\n" # XXX need clean_pcdata
         else
           res = inner(el, indent, opts)
@@ -1002,10 +1232,16 @@ COLORS
         warn "(#{"%.3f" % (t2 - t1)} s)" if KRAMDOWN_PERSISTENT_VERBOSE
       end
 
+      def get_doi(refname)
+        lit = doi_fetch_and_convert(refname, fuzzy: true)
+        anchor = "DOI_#{refname.gsub("/", "_")}"
+        KramdownRFC::ref_to_xml(anchor, lit)
+      end
+
       # this is now slightly dangerous as multiple urls could map to the same cachefile
       def get_and_cache_resource(url, cachefile, tvalid = 7200, tn = Time.now)
         fn = "#{REFCACHEDIR}/#{cachefile}"
-        Dir.mkdir(REFCACHEDIR) unless Dir.exists?(REFCACHEDIR)
+        Dir.mkdir(REFCACHEDIR) unless Dir.exist?(REFCACHEDIR)
         f = File.stat(fn) rescue nil unless KRAMDOWN_REFCACHE_REFETCH
         if !KRAMDOWN_OFFLINE && (!f || tn - f.mtime >= tvalid)
           if f
@@ -1016,7 +1252,17 @@ COLORS
             fetch_timeout = 60 # seconds; long timeout needed for Travis
           end
           $stderr.puts "#{fn}: #{message} from #{url}"
-          if ENV["HAVE_WGET"]
+          if Array === url
+            begin
+              case url[0]
+              when :DOI
+                ref = get_doi(url[1])
+                File.write(fn, ref)
+              end
+            rescue Exception => e
+              warn "*** Error fetching #{url[0]} #{url[1].inspect}: #{e}"
+            end
+          elsif ENV["HAVE_WGET"]
             `cd #{REFCACHEDIR}; wget -t 3 -T #{fetch_timeout} -Nnv "#{url}"` # ignore errors if offline (hack)
             begin
               File.utime nil, nil, fn
@@ -1060,20 +1306,28 @@ COLORS
          "#{XML_RESOURCE_ORG_PREFIX}/bibxml-rfcsubseries/#{name}"] # FOR NOW
       end
 
+      KRAMDOWN_REFCACHETTL = (e = ENV["KRAMDOWN_REFCACHETTL"]) ? e.to_i : 3600
+
+      KRAMDOWN_REFCACHETTL_RFC = (e = ENV["KRAMDOWN_REFCACHETTL_RFC"]) ? e.to_i : 86400*7
+      KRAMDOWN_REFCACHETTL_DOI_IANA = (e = ENV["KRAMDOWN_REFCACHETTL_DOI_IANA"]) ? e.to_i : 86400
+      KRAMDOWN_REFCACHETTL_DOI = (e = ENV["KRAMDOWN_REFCACHETTL_DOI"]) ? e.to_i : KRAMDOWN_REFCACHETTL_DOI_IANA
+      KRAMDOWN_REFCACHETTL_IANA = (e = ENV["KRAMDOWN_REFCACHETTL_IANA"]) ? e.to_i : KRAMDOWN_REFCACHETTL_DOI_IANA
+
       # [subdirectory name, cache ttl in seconds, does it provide for ?anchor=]
       XML_RESOURCE_ORG_MAP = {
-        "RFC" => ["bibxml", 86400*7, false,
+        "RFC" => ["bibxml", KRAMDOWN_REFCACHETTL_RFC, false,
                   ->(fn, n){ [name = "reference.RFC.#{"%04d" % n.to_i}.xml",
-                              "https://www.rfc-editor.org/refs/bibxml/#{name}"] }
+                              "https://bib.ietf.org/public/rfc/bibxml/#{name}"] }
+# was                         "https://www.rfc-editor.org/refs/bibxml/#{name}"] }
                  ],
         "I-D" => ["bibxml3", false, false,
                   ->(fn, n){ [fn,
                               "https://datatracker.ietf.org/doc/bibxml3/draft-#{n.sub(/\Adraft-/, '')}.xml"] }
                  ],
-        "BCP" => ["bibxml-rfcsubseries", 86400*7, false,
+        "BCP" => ["bibxml-rfcsubseries", KRAMDOWN_REFCACHETTL_RFC, false,
                   ->(fn, n){ Rfc2629::bcp_std_ref("BCP", n) }
                  ],
-        "STD" => ["bibxml-rfcsubseries", 86400*7, false,
+        "STD" => ["bibxml-rfcsubseries", KRAMDOWN_REFCACHETTL_RFC, false,
                   ->(fn, n){ Rfc2629::bcp_std_ref("STD", n) }
                  ],
         "W3C" => "bibxml4",
@@ -1089,8 +1343,10 @@ COLORS
         "NIST" => "bibxml2",
         "OASIS" => "bibxml2",
         "PKCS" => "bibxml2",
-        "DOI" => ["bibxml7", 86400, true], # 24 h cache at source anyway
-        "IANA" => ["bibxml8", 86400, true], # ditto
+        "DOI" => ["bibxml7", KRAMDOWN_REFCACHETTL_DOI, true,
+                  ->(fn, n){ ["computed-#{fn}", [:DOI, n] ] }, true # always_altproc
+                 ], # emulate old 24 h cache
+        "IANA" => ["bibxml8", KRAMDOWN_REFCACHETTL_IANA, true], # ditto
       }
 
       # XML_RESOURCE_ORG_HOST = ENV["XML_RESOURCE_ORG_HOST"] || "xml.resource.org"
@@ -1100,9 +1356,8 @@ COLORS
                                 "https://#{XML_RESOURCE_ORG_HOST}/public/rfc"
       KRAMDOWN_USE_TOOLS_SERVER = ENV["KRAMDOWN_USE_TOOLS_SERVER"]
 
-      KRAMDOWN_REFCACHETTL = (e = ENV["KRAMDOWN_REFCACHETTL"]) ? e.to_i : 3600
-
       KRAMDOWN_NO_TARGETS = ENV['KRAMDOWN_NO_TARGETS']
+      KRAMDOWN_KEEP_TARGETS = ENV['KRAMDOWN_KEEP_TARGETS']
 
       def convert_img(el, indent, opts) # misuse the tag!
         if a = el.attr
@@ -1113,6 +1368,7 @@ COLORS
           end
         end
         if alt == ":include:"   # Really bad misuse of tag...
+          ann = el.attr.delete('ann')
           anchor = el.attr.delete('anchor') || (
             # not yet
             warn "*** missing anchor for '#{src}'"
@@ -1122,14 +1378,16 @@ COLORS
           anchor.gsub!('/', '_')              # should take out all illegals
           to_insert = ""
           src.scan(/(W3C|3GPP|[A-Z-]+)[.]?([A-Za-z_0-9.\(\)\/\+-]+)/) do |t, n|
+            never_altproc = n.sub!(/^[.]/, "")
             fn = "reference.#{t}.#{n}.xml"
-            sub, ttl, _can_anchor, altproc = XML_RESOURCE_ORG_MAP[t]
+            sub, ttl, _can_anchor, altproc, always_altproc = XML_RESOURCE_ORG_MAP[t]
             ttl ||= KRAMDOWN_REFCACHETTL  # everything but RFCs might change a lot
             puts "*** Huh: #{fn}" unless sub
-            if altproc && !KRAMDOWN_USE_TOOLS_SERVER
+            if altproc && !never_altproc && (!KRAMDOWN_USE_TOOLS_SERVER || always_altproc)
               fn, url = altproc.call(fn, n)
             else
               url = "#{XML_RESOURCE_ORG_PREFIX}/#{sub}/#{fn}"
+              fn = "alt-#{fn}" if never_altproc || KRAMDOWN_USE_TOOLS_SERVER
             end
             # if can_anchor # create anchor server-side for stand_alone: false
             #   url << "?anchor=#{anchor}"
@@ -1141,9 +1399,11 @@ COLORS
             begin
               d = REXML::Document.new(to_insert)
               d.xml_decl.nowrite
+              d.delete d.doctype
+              d.context[:attribute_quote] = :quote  # Set double-quote as the attribute value delimiter
               d.root.attributes["anchor"] = anchor
               if t == "RFC" or t == "I-D"
-                if KRAMDOWN_NO_TARGETS
+                if KRAMDOWN_NO_TARGETS || !KRAMDOWN_KEEP_TARGETS
                   d.root.attributes["target"] = nil
                   REXML::XPath.each(d.root, "/reference/format") { |x|
                     d.root.delete_element(x)
@@ -1156,6 +1416,11 @@ COLORS
                 end
               elsif t == "IANA"
                 d.root.attributes["target"].sub!(%r{\Ahttp://www.iana.org/assignments/}, 'https://www.iana.org/assignments/')
+              end
+              if ann
+                el = ::Kramdown::Converter::Rfc2629::process_markdown_to_rexml(ann).root
+                el.name = "annotation"
+                d.root.add_element(el)
               end
               to_insert = d.to_s
             rescue Exception => e
@@ -1215,7 +1480,7 @@ COLORS
       end
 
       def convert_raw(el, indent, opts)
-        end_sections(1, indent) +
+        end_sections(1, indent, el.options[:location]) +
         el.value + (el.options[:category] == :block ? "\n" : '')
       end
 
@@ -1321,6 +1586,19 @@ COLORS
         "<iref#{html_attributes(attr)}/>"
       end
 
+      def nobr_hack(s)          # replace this by actual <nobr> once that exists
+        # https://github.com/ietf-tools/xml2rfc/blob/main/xml2rfc/utils.py#L42
+        s.gsub(/([-\s\/])(?!\s)/) { case rep = $1
+                                   when /\A\s\z/
+                                     "\u00A0" # nbsp
+                                   when "-"
+                                     "\u2011" # nbhy -- XXX this might mangle dashes
+                                   else
+                                     "#{rep}\u2060"
+                                   end
+        }
+      end
+
       def convert_iref(el, indent, opts)
         iref_attr(el.attr['target'])
       end
@@ -1343,6 +1621,18 @@ COLORS
           return "<bcp14>#{value}</bcp14>"
         end
 
+        hacked_value = value
+
+        nobr = false
+        if title && title =~ /\A<nobr>(\z|\s)/
+          nobr = true
+          _nobr, title = title.split(' ', 2)
+          hacked_value = nobr_hack(value)
+          if title.nil? || title.empty?
+            return hacked_value # we have "exhausted" this abbrev -- suppress normal meaning
+          end
+        end
+
         if title && title[0] == "#"
           target, title = title.split(' ', 2)
           if target == "#"
@@ -1355,20 +1645,28 @@ COLORS
         end
 
         if item = title
-          m = title.scan(Parser::RFC2629Kramdown::IREF_START)
-          if m.empty?
+          pairs = title.split(Parser::RFC2629Kramdown::IREF_START).each_slice(2).to_a
+          replacement = pairs.map {|x,| s = x.strip; s unless s.empty?}.compact.join(" ")
+          irefs = pairs.map {|_,x| x && [x]}.compact
+          warn "@@@ ABBREV MISMATCH #{irefs}" if title.scan(Parser::RFC2629Kramdown::IREF_START) != irefs
+          if irefs.empty?
             subitem = value
           else
-            iref = m.map{|a,| iref_attr(a)}.join('')
+            iref = irefs.map{|a,| iref_attr(a)}.join('')
+          end
+          unless replacement.empty?
+            replacement = nobr_hack(replacement) if nobr # XXX this can break XML
+            replacement = ::Kramdown::Converter::Rfc2629::process_markdown(replacement)
+            hacked_value = replacement
           end
         else
           item = value
         end
         iref ||= "<iref#{html_attributes(item: item, subitem: subitem)}/>"
         if target
-          "<xref#{html_attributes(target: target, format: "none")}>#{value}</xref>#{iref}"
+          "#{iref}<xref#{html_attributes(target: target, format: "none")}>#{hacked_value}</xref>"
         else
-          "#{value}#{iref}"
+          "#{iref}#{hacked_value}"
         end
       end
 
